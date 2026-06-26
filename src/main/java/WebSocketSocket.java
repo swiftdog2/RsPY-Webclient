@@ -1,107 +1,179 @@
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.Method;
 import java.net.Socket;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.WebSocket;
-import java.nio.ByteBuffer;
-import java.time.Duration;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
-import java.util.concurrent.TimeUnit;
+import java.util.Base64;
 
 /**
- * Socket-shaped wrapper around a WebSocket.
+ * CheerpJ browser WebSocket transport.
  *
- * The old 317 client expects a java.net.Socket with:
- *   getInputStream()
- *   getOutputStream()
- *   setSoTimeout()
- *   setTcpNoDelay()
- *   close()
+ * This replaces the broken java.net.http.WebSocket version.
  *
- * This class keeps that surface area, but the real transport is WebSocket.
+ * It does NOT use:
+ *   java.net.http.HttpClient
+ *   java.net.http.WebSocket
+ *   java.nio.channels.Selector
+ *
+ * Instead, it calls browser JavaScript functions supplied by rspy-ws-bridge.js.
+ *
+ * Required page script:
+ *   <script src="/rspy-ws-bridge.js"></script>
  */
 public final class WebSocketSocket extends Socket {
 
-    private final Object lock = new Object();
+    private static final int CONNECT_TIMEOUT_MS = 15000;
+    private static final int POLL_SLEEP_MS = 5;
 
-    private final URI uri;
-    private final WebSocket webSocket;
+    private static Object jsWindow;
+    private static Method jsCallMethod;
+    private static Method jsEvalMethod;
+    private static boolean jsInitialized = false;
+
+    private final int socketId;
+    private final String url;
+
     private final InputStream inputStream;
     private final OutputStream outputStream;
 
-    private final byte[] readBuffer = new byte[1 << 20];
-    private int readHead = 0;
-    private int readTail = 0;
-    private int readSize = 0;
-
     private volatile boolean closed = false;
-    private volatile boolean connected = false;
     private volatile int soTimeoutMillis = 30000;
 
     public WebSocketSocket(String url) throws IOException {
-        try {
-            this.uri = URI.create(url);
+        this.url = url;
 
-            this.inputStream = new Input();
-            this.outputStream = new Output();
+        initJavaScriptBridge();
 
-            HttpClient client = HttpClient.newBuilder()
-                    .connectTimeout(Duration.ofSeconds(15))
-                    .build();
+        Object opened = jsCall("rspyWsOpen", new Object[] { url });
 
-            this.webSocket = client.newWebSocketBuilder()
-                    .connectTimeout(Duration.ofSeconds(15))
-                    .buildAsync(this.uri, new Listener())
-                    .get(15, TimeUnit.SECONDS);
-
-            this.connected = true;
-
-            System.out.println("[RSPY WEBCLIENT] Connected WebSocket transport: " + url);
-        } catch (Exception e) {
-            throw new IOException("Failed to open WebSocket transport: " + url, e);
+        if (!(opened instanceof Number)) {
+            throw new IOException("rspyWsOpen did not return a numeric socket id. Returned: " + opened);
         }
+
+        this.socketId = ((Number) opened).intValue();
+
+        waitForOpen();
+
+        this.inputStream = new Input();
+        this.outputStream = new Output();
+
+        System.out.println("[RSPY WEBCLIENT] Connected browser JS WebSocket transport: " + url + " id=" + socketId);
     }
 
-    private int bufferedAvailable() {
-        synchronized (lock) {
-            return readSize;
-        }
-    }
-
-    private void feed(byte[] data) {
-        if (data == null || data.length == 0) {
+    private static synchronized void initJavaScriptBridge() throws IOException {
+        if (jsInitialized) {
             return;
         }
 
-        synchronized (lock) {
-            if (closed) {
-                return;
+        try {
+            Class<?> jsObjectClass = Class.forName("netscape.javascript.JSObject");
+
+            /*
+             * Old LiveConnect shape:
+             *   JSObject.getWindow(Applet)
+             *
+             * CheerpJ commonly supports applet-era Java apps, so this is the
+             * least invasive bridge to try first. We do this by reflection so
+             * the source compiles even when the IDE/module setup is awkward.
+             */
+            Class<?> appletClass = Class.forName("java.applet.Applet");
+            Method getWindow = jsObjectClass.getMethod("getWindow", appletClass);
+
+            jsWindow = getWindow.invoke(null, new Object[] { null });
+            jsCallMethod = jsObjectClass.getMethod("call", String.class, Object[].class);
+            jsEvalMethod = jsObjectClass.getMethod("eval", String.class);
+
+            if (jsWindow == null) {
+                throw new IOException("JSObject.getWindow(null) returned null.");
             }
 
-            for (byte b : data) {
-                if (readSize >= readBuffer.length) {
-                    readHead = (readHead + 1) % readBuffer.length;
-                    readSize--;
-                }
+            Object bridgeType = jsEval("typeof window.rspyWsOpen");
 
-                readBuffer[readTail] = b;
-                readTail = (readTail + 1) % readBuffer.length;
-                readSize++;
+            if (!"function".equals(String.valueOf(bridgeType))) {
+                throw new IOException(
+                        "Browser bridge is not loaded. Missing window.rspyWsOpen. " +
+                        "Add <script src=\"/rspy-ws-bridge.js\"></script> before cheerpjRunJar()."
+                );
             }
 
-            lock.notifyAll();
+            jsInitialized = true;
+            System.out.println("[RSPY WEBCLIENT] JS bridge initialized.");
+        } catch (IOException e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new IOException(
+                    "Could not initialize CheerpJ JavaScript bridge. " +
+                    "This build requires CheerpJ/LiveConnect JSObject support.",
+                    t
+            );
         }
     }
 
-    private int readOne() throws IOException {
-        byte[] one = new byte[1];
-        int n = readBytes(one, 0, 1);
-        return n <= 0 ? -1 : (one[0] & 0xff);
+    private static Object jsCall(String name, Object[] args) throws IOException {
+        try {
+            return jsCallMethod.invoke(jsWindow, name, new Object[] { args });
+        } catch (Throwable t) {
+            throw new IOException("JavaScript call failed: " + name, t);
+        }
+    }
+
+    private static Object jsEval(String script) throws IOException {
+        try {
+            return jsEvalMethod.invoke(jsWindow, script);
+        } catch (Throwable t) {
+            throw new IOException("JavaScript eval failed.", t);
+        }
+    }
+
+    private void waitForOpen() throws IOException {
+        long deadline = System.currentTimeMillis() + CONNECT_TIMEOUT_MS;
+
+        while (System.currentTimeMillis() < deadline) {
+            int state = state();
+
+            if (state == 1) {
+                return;
+            }
+
+            if (state == 3 || state == 4) {
+                String err = String.valueOf(jsCall("rspyWsError", new Object[] { Integer.valueOf(socketId) }));
+                throw new IOException("WebSocket failed to open. state=" + state + " error=" + err);
+            }
+
+            sleepQuietly(POLL_SLEEP_MS);
+        }
+
+        throw new SocketTimeoutException("Timed out opening browser WebSocket: " + url);
+    }
+
+    private int state() throws IOException {
+        Object out = jsCall("rspyWsState", new Object[] { Integer.valueOf(socketId) });
+
+        if (out instanceof Number) {
+            return ((Number) out).intValue();
+        }
+
+        try {
+            return Integer.parseInt(String.valueOf(out));
+        } catch (NumberFormatException e) {
+            return 4;
+        }
+    }
+
+    private int availableBytes() throws IOException {
+        Object out = jsCall("rspyWsAvailable", new Object[] { Integer.valueOf(socketId) });
+
+        if (out instanceof Number) {
+            return ((Number) out).intValue();
+        }
+
+        try {
+            return Integer.parseInt(String.valueOf(out));
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 
     private int readBytes(byte[] dst, int off, int len) throws IOException {
@@ -117,46 +189,52 @@ public final class WebSocketSocket extends Socket {
             return 0;
         }
 
-        long deadline = 0L;
-        boolean timed = soTimeoutMillis > 0;
+        long deadline = soTimeoutMillis > 0 ? System.currentTimeMillis() + soTimeoutMillis : 0L;
 
-        if (timed) {
-            deadline = System.currentTimeMillis() + soTimeoutMillis;
-        }
+        while (!closed) {
+            int available = availableBytes();
 
-        synchronized (lock) {
-            while (readSize == 0 && !closed) {
-                try {
-                    if (!timed) {
-                        lock.wait();
-                    } else {
-                        long remaining = deadline - System.currentTimeMillis();
-                        if (remaining <= 0L) {
-                            throw new SocketTimeoutException("WebSocket read timed out");
-                        }
+            if (available > 0) {
+                int wanted = Math.min(len, available);
 
-                        lock.wait(remaining);
-                    }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted while reading WebSocket stream", e);
+                Object encodedObj = jsCall(
+                        "rspyWsRead",
+                        new Object[] { Integer.valueOf(socketId), Integer.valueOf(wanted) }
+                );
+
+                String encoded = String.valueOf(encodedObj);
+
+                if (encoded == null || encoded.length() == 0 || "null".equals(encoded)) {
+                    continue;
                 }
+
+                byte[] decoded = Base64.getDecoder().decode(encoded);
+                int n = Math.min(len, decoded.length);
+                System.arraycopy(decoded, 0, dst, off, n);
+                return n;
             }
 
-            if (readSize == 0 && closed) {
+            int state = state();
+
+            if (state == 3 || state == 4) {
+                closed = true;
                 return -1;
             }
 
-            int n = Math.min(len, readSize);
-
-            for (int i = 0; i < n; i++) {
-                dst[off + i] = readBuffer[readHead];
-                readHead = (readHead + 1) % readBuffer.length;
-                readSize--;
+            if (soTimeoutMillis > 0 && System.currentTimeMillis() >= deadline) {
+                throw new SocketTimeoutException("WebSocket read timed out.");
             }
 
-            return n;
+            sleepQuietly(POLL_SLEEP_MS);
         }
+
+        return -1;
+    }
+
+    private int readOne() throws IOException {
+        byte[] one = new byte[1];
+        int n = readBytes(one, 0, 1);
+        return n <= 0 ? -1 : (one[0] & 0xff);
     }
 
     private void sendBytes(byte[] src, int off, int len) throws IOException {
@@ -173,17 +251,31 @@ public final class WebSocketSocket extends Socket {
         }
 
         if (closed) {
-            throw new SocketException("WebSocket socket is closed");
+            throw new SocketException("WebSocket socket is closed.");
         }
 
         byte[] copy = new byte[len];
         System.arraycopy(src, off, copy, 0, len);
 
+        String encoded = Base64.getEncoder().encodeToString(copy);
+
+        Object ok = jsCall(
+                "rspyWsSend",
+                new Object[] { Integer.valueOf(socketId), encoded }
+        );
+
+        if (!Boolean.TRUE.equals(ok) && !"true".equals(String.valueOf(ok))) {
+            int state = state();
+            String err = String.valueOf(jsCall("rspyWsError", new Object[] { Integer.valueOf(socketId) }));
+            throw new IOException("WebSocket send failed. state=" + state + " error=" + err);
+        }
+    }
+
+    private static void sleepQuietly(int ms) {
         try {
-            webSocket.sendBinary(ByteBuffer.wrap(copy), true).get(15, TimeUnit.SECONDS);
-        } catch (Exception e) {
-            close();
-            throw new IOException("Failed to write WebSocket payload", e);
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -209,7 +301,7 @@ public final class WebSocketSocket extends Socket {
 
     @Override
     public void setTcpNoDelay(boolean on) {
-        // No-op. WebSocket transport has its own framing.
+        // No-op for browser WebSocket transport.
     }
 
     @Override
@@ -219,7 +311,11 @@ public final class WebSocketSocket extends Socket {
 
     @Override
     public boolean isConnected() {
-        return connected && !closed;
+        try {
+            return !closed && state() == 1;
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     @Override
@@ -234,14 +330,9 @@ public final class WebSocketSocket extends Socket {
         }
 
         closed = true;
-        connected = false;
-
-        synchronized (lock) {
-            lock.notifyAll();
-        }
 
         try {
-            webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "closed");
+            jsCall("rspyWsClose", new Object[] { Integer.valueOf(socketId) });
         } catch (Throwable ignored) {
         }
     }
@@ -268,8 +359,8 @@ public final class WebSocketSocket extends Socket {
         }
 
         @Override
-        public int available() {
-            return bufferedAvailable();
+        public int available() throws IOException {
+            return availableBytes();
         }
 
         @Override
@@ -292,55 +383,12 @@ public final class WebSocketSocket extends Socket {
 
         @Override
         public void flush() {
-            // sendBinary already queues the frame.
+            // Browser WebSocket sends immediately.
         }
 
         @Override
         public void close() {
             WebSocketSocket.this.close();
-        }
-    }
-
-    private final class Listener implements WebSocket.Listener {
-        @Override
-        public void onOpen(WebSocket webSocket) {
-            connected = true;
-            webSocket.request(1);
-        }
-
-        @Override
-        public CompletionStage<?> onBinary(WebSocket webSocket, ByteBuffer data, boolean last) {
-            byte[] copy = new byte[data.remaining()];
-            data.get(copy);
-            feed(copy);
-            webSocket.request(1);
-            return CompletableFuture.completedFuture(null);
-        }
-
-        @Override
-        public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
-            webSocket.request(1);
-            return CompletableFuture.completedFuture(null);
-        }
-
-        @Override
-        public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
-            closed = true;
-            connected = false;
-            synchronized (lock) {
-                lock.notifyAll();
-            }
-            return CompletableFuture.completedFuture(null);
-        }
-
-        @Override
-        public void onError(WebSocket webSocket, Throwable error) {
-            closed = true;
-            connected = false;
-            synchronized (lock) {
-                lock.notifyAll();
-            }
-            System.out.println("[RSPY WEBCLIENT] WebSocket error: " + error);
         }
     }
 }

@@ -2,13 +2,13 @@ import java.io.IOException;
 import java.net.Socket;
 
 /**
- * Centralized client socket opener.
+ * Centralized socket opener.
  *
- * Desktop/offline:
+ * Desktop/offline mode:
  *   normal TCP socket
  *
- * Browser/CheerpJ:
- *   WebSocket-backed socket
+ * Browser/CheerpJ mode:
+ *   WebSocketSocket using browser JavaScript bridge
  */
 public final class RspyClientSocketFactory {
 

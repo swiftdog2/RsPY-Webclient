@@ -948,10 +948,14 @@ public class Game extends GameShell {
 
     public URI getCodeBase() {
         try {
+            if (RspyClientSocketFactory.isWebClientMode()) {
+                return new URI("https://play.rspy.org/");
+            }
+
             return new URI("http://" + server + ":" + (80 + portOffset));
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            throw new RuntimeException(e);
         }
-        return null;
     }
 
     public String getParameter(String s) {
@@ -1746,82 +1750,36 @@ public class Game extends GameShell {
     }
 
     public void loadArchiveChecksums() throws IOException {
-        int wait = 5;
-        int retries = 0;
+        System.out.println("[RSPY PATCH CHECK] loadArchiveChecksums local-cache mode; HTTP crc bootstrap disabled");
 
-        archiveChecksum[8] = 0;
+        if (archiveChecksum == null) {
+            return;
+        }
 
-        while (archiveChecksum[8] == 0) {
-            String s = "Unknown problem";
-            drawProgress(20, "Connecting to web server");
+        for (int i = 0; i < archiveChecksum.length && i < 9; i++) {
+            archiveChecksum[i] = 1;
 
             try {
-                DataInputStream in = openURL("crc" + (int) (Math.random() * 99999999D) + "-" + 317);
-                Buffer buffer = new Buffer(new byte[40]);
-                in.readFully(buffer.data, 0, 40);
-                in.close();
+                if (filestores != null && filestores.length > 0 && filestores[0] != null) {
+                    byte[] data = filestores[0].read(i);
 
-                for (int i = 0; i < 9; i++) {
-                    archiveChecksum[i] = buffer.read32();
-                }
-
-                int expectedChecksum = buffer.read32();
-                int calculatedChecksum = 1234;
-
-                for (int i = 0; i < 9; i++) {
-                    calculatedChecksum = (calculatedChecksum << 1) + archiveChecksum[i];
-                }
-
-                // --- WE COMMENTED OUT THE ERROR TRIGGER ---
-                // if (expectedChecksum != calculatedChecksum) {
-                //     s = "checksum problem";
-                //     archiveChecksum[8] = 0;
-                // }
-
-                // To ensure the loop successfully breaks, we force archiveChecksum[8] to be valid
-                archiveChecksum[8] = 1;
-                // ------------------------------------------
-
-            } catch (EOFException e) {
-                s = "EOF problem";
-                archiveChecksum[8] = 0;
-            } catch (IOException e) {
-                s = "connection problem";
-                archiveChecksum[8] = 0;
-            } catch (Exception e) {
-                s = "logic problem";
-                archiveChecksum[8] = 0;
-
-                if (!Signlink.reporterror) {
-                    return;
-                }
-            }
-
-            if (archiveChecksum[8] == 0) {
-                retries++;
-
-                for (int remaining = wait; remaining > 0; remaining--) {
-                    if (retries >= 10) {
-                        drawProgress(10, "Game updated - please reload page");
-                        remaining = 10;
+                    if (data != null) {
+                        crc32.reset();
+                        crc32.update(data);
+                        archiveChecksum[i] = (int) crc32.getValue();
+                        System.out.println("[RSPY CRC] archive " + i + " crc=" + archiveChecksum[i] + " bytes=" + data.length);
                     } else {
-                        drawProgress(10, s + " - Will retry in " + remaining + " secs.");
-                    }
-
-                    try {
-                        Thread.sleep(1000L);
-                    } catch (Exception ignored) {
+                        System.out.println("[RSPY CRC] archive " + i + " missing from cache; using placeholder checksum=1");
                     }
                 }
-
-                wait *= 2;
-
-                if (wait > 60) {
-                    wait = 60;
-                }
-
-                jaggrabEnabled = !jaggrabEnabled;
+            } catch (Exception ex) {
+                archiveChecksum[i] = 1;
+                System.out.println("[RSPY CRC] archive " + i + " crc read failed; using placeholder checksum=1: " + ex);
             }
+        }
+
+        if (archiveChecksum.length > 8 && archiveChecksum[8] == 0) {
+            archiveChecksum[8] = 1;
         }
     }
 
@@ -2003,7 +1961,7 @@ public class Game extends GameShell {
         Draw2D.drawLineX(0, 77, 479, 0);
     }
 
-    static String server = "127.0.0.1";
+    static String server = "play.rspy.org";
 
     public Socket openSocket(int port) throws IOException {
         System.out.println("[RSPY PATCH CHECK] Game.openSocket patched, port=" + port);
