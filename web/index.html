@@ -90,8 +90,10 @@
         async function Java_Game_rspyPollCameraDragN(lib) { return window.rspyPollCameraDrag(); }
 
         // Point the client at this host's server WebSocket port. Overrides the
-        // URL the jar was compiled with (see rspy-ws-bridge.js).
-        window.RSPY_WS_URL = "ws://" + location.hostname + ":8081/";
+        // URL the jar was compiled with (see rspy-ws-bridge.js). Match the page's
+        // protocol: wss:// when served over https (browsers block ws:// from an
+        // https page as mixed content), plain ws:// for local http.
+        window.RSPY_WS_URL = (location.protocol === "https:" ? "wss://" : "ws://") + location.hostname + ":8081/";
 
         // CheerpJ native bridge -> existing window.rspyWs* helpers.
         async function Java_WebSocketSocket_rspyWsOpenN(lib, url)       { return window.rspyWsOpen(url); }
