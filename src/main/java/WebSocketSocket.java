@@ -1,7 +1,6 @@
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.lang.reflect.Method;
 import java.net.Socket;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
@@ -16,21 +15,34 @@ import java.util.Base64;
  *   java.net.http.HttpClient
  *   java.net.http.WebSocket
  *   java.nio.channels.Selector
+ *   netscape.javascript.JSObject (applet LiveConnect, removed in JDK 11 and
+ *                                 not implemented by CheerpJ 3)
  *
- * Instead, it calls browser JavaScript functions supplied by rspy-ws-bridge.js.
+ * Instead, it calls browser JavaScript through CheerpJ native methods. Each
+ * native below is implemented in JavaScript as Java_WebSocketSocket_<name> and
+ * registered in cheerpjInit({ natives: { ... } }). Those JS shims forward to the
+ * existing window.rspyWs* bridge functions supplied by rspy-ws-bridge.js.
  *
- * Required page script:
- *   <script src="/rspy-ws-bridge.js"></script>
+ * Required page wiring:
+ *   <script src="/rspy-ws-bridge.js"></script>   // defines window.rspyWs*
+ *   cheerpjInit({ natives: { Java_WebSocketSocket_rspyWsOpenN, ... } })
  */
 public final class WebSocketSocket extends Socket {
 
     private static final int CONNECT_TIMEOUT_MS = 15000;
     private static final int POLL_SLEEP_MS = 5;
 
-    private static Object jsWindow;
-    private static Method jsCallMethod;
-    private static Method jsEvalMethod;
-    private static boolean jsInitialized = false;
+    /*
+     * CheerpJ native bridge. Implemented in JS as Java_WebSocketSocket_<name>
+     * and registered via cheerpjInit({ natives: { ... } }).
+     */
+    private static native int rspyWsOpenN(String url);
+    private static native int rspyWsStateN(int id);
+    private static native int rspyWsAvailableN(int id);
+    private static native String rspyWsReadN(int id, int len);
+    private static native boolean rspyWsSendN(int id, String b64);
+    private static native String rspyWsErrorN(int id);
+    private static native void rspyWsCloseN(int id);
 
     private final int socketId;
     private final String url;
@@ -44,15 +56,20 @@ public final class WebSocketSocket extends Socket {
     public WebSocketSocket(String url) throws IOException {
         this.url = url;
 
-        initJavaScriptBridge();
+        int opened;
 
-        Object opened = jsCall("rspyWsOpen", new Object[] { url });
-
-        if (!(opened instanceof Number)) {
-            throw new IOException("rspyWsOpen did not return a numeric socket id. Returned: " + opened);
+        try {
+            opened = rspyWsOpenN(url);
+        } catch (UnsatisfiedLinkError e) {
+            throw new IOException(
+                    "CheerpJ native bridge not registered. Add the Java_WebSocketSocket_* " +
+                    "functions to cheerpjInit({ natives: { ... } }) and ensure rspy-ws-bridge.js " +
+                    "is loaded before cheerpjRunJar().",
+                    e
+            );
         }
 
-        this.socketId = ((Number) opened).intValue();
+        this.socketId = opened;
 
         waitForOpen();
 
@@ -60,71 +77,6 @@ public final class WebSocketSocket extends Socket {
         this.outputStream = new Output();
 
         System.out.println("[RSPY WEBCLIENT] Connected browser JS WebSocket transport: " + url + " id=" + socketId);
-    }
-
-    private static synchronized void initJavaScriptBridge() throws IOException {
-        if (jsInitialized) {
-            return;
-        }
-
-        try {
-            Class<?> jsObjectClass = Class.forName("netscape.javascript.JSObject");
-
-            /*
-             * Old LiveConnect shape:
-             *   JSObject.getWindow(Applet)
-             *
-             * CheerpJ commonly supports applet-era Java apps, so this is the
-             * least invasive bridge to try first. We do this by reflection so
-             * the source compiles even when the IDE/module setup is awkward.
-             */
-            Class<?> appletClass = Class.forName("java.applet.Applet");
-            Method getWindow = jsObjectClass.getMethod("getWindow", appletClass);
-
-            jsWindow = getWindow.invoke(null, new Object[] { null });
-            jsCallMethod = jsObjectClass.getMethod("call", String.class, Object[].class);
-            jsEvalMethod = jsObjectClass.getMethod("eval", String.class);
-
-            if (jsWindow == null) {
-                throw new IOException("JSObject.getWindow(null) returned null.");
-            }
-
-            Object bridgeType = jsEval("typeof window.rspyWsOpen");
-
-            if (!"function".equals(String.valueOf(bridgeType))) {
-                throw new IOException(
-                        "Browser bridge is not loaded. Missing window.rspyWsOpen. " +
-                        "Add <script src=\"/rspy-ws-bridge.js\"></script> before cheerpjRunJar()."
-                );
-            }
-
-            jsInitialized = true;
-            System.out.println("[RSPY WEBCLIENT] JS bridge initialized.");
-        } catch (IOException e) {
-            throw e;
-        } catch (Throwable t) {
-            throw new IOException(
-                    "Could not initialize CheerpJ JavaScript bridge. " +
-                    "This build requires CheerpJ/LiveConnect JSObject support.",
-                    t
-            );
-        }
-    }
-
-    private static Object jsCall(String name, Object[] args) throws IOException {
-        try {
-            return jsCallMethod.invoke(jsWindow, name, new Object[] { args });
-        } catch (Throwable t) {
-            throw new IOException("JavaScript call failed: " + name, t);
-        }
-    }
-
-    private static Object jsEval(String script) throws IOException {
-        try {
-            return jsEvalMethod.invoke(jsWindow, script);
-        } catch (Throwable t) {
-            throw new IOException("JavaScript eval failed.", t);
-        }
     }
 
     private void waitForOpen() throws IOException {
@@ -138,7 +90,7 @@ public final class WebSocketSocket extends Socket {
             }
 
             if (state == 3 || state == 4) {
-                String err = String.valueOf(jsCall("rspyWsError", new Object[] { Integer.valueOf(socketId) }));
+                String err = String.valueOf(rspyWsErrorN(socketId));
                 throw new IOException("WebSocket failed to open. state=" + state + " error=" + err);
             }
 
@@ -149,31 +101,11 @@ public final class WebSocketSocket extends Socket {
     }
 
     private int state() throws IOException {
-        Object out = jsCall("rspyWsState", new Object[] { Integer.valueOf(socketId) });
-
-        if (out instanceof Number) {
-            return ((Number) out).intValue();
-        }
-
-        try {
-            return Integer.parseInt(String.valueOf(out));
-        } catch (NumberFormatException e) {
-            return 4;
-        }
+        return rspyWsStateN(socketId);
     }
 
     private int availableBytes() throws IOException {
-        Object out = jsCall("rspyWsAvailable", new Object[] { Integer.valueOf(socketId) });
-
-        if (out instanceof Number) {
-            return ((Number) out).intValue();
-        }
-
-        try {
-            return Integer.parseInt(String.valueOf(out));
-        } catch (NumberFormatException e) {
-            return 0;
-        }
+        return rspyWsAvailableN(socketId);
     }
 
     private int readBytes(byte[] dst, int off, int len) throws IOException {
@@ -197,12 +129,7 @@ public final class WebSocketSocket extends Socket {
             if (available > 0) {
                 int wanted = Math.min(len, available);
 
-                Object encodedObj = jsCall(
-                        "rspyWsRead",
-                        new Object[] { Integer.valueOf(socketId), Integer.valueOf(wanted) }
-                );
-
-                String encoded = String.valueOf(encodedObj);
+                String encoded = rspyWsReadN(socketId, wanted);
 
                 if (encoded == null || encoded.length() == 0 || "null".equals(encoded)) {
                     continue;
@@ -259,14 +186,11 @@ public final class WebSocketSocket extends Socket {
 
         String encoded = Base64.getEncoder().encodeToString(copy);
 
-        Object ok = jsCall(
-                "rspyWsSend",
-                new Object[] { Integer.valueOf(socketId), encoded }
-        );
+        boolean ok = rspyWsSendN(socketId, encoded);
 
-        if (!Boolean.TRUE.equals(ok) && !"true".equals(String.valueOf(ok))) {
+        if (!ok) {
             int state = state();
-            String err = String.valueOf(jsCall("rspyWsError", new Object[] { Integer.valueOf(socketId) }));
+            String err = String.valueOf(rspyWsErrorN(socketId));
             throw new IOException("WebSocket send failed. state=" + state + " error=" + err);
         }
     }
@@ -332,7 +256,7 @@ public final class WebSocketSocket extends Socket {
         closed = true;
 
         try {
-            jsCall("rspyWsClose", new Object[] { Integer.valueOf(socketId) });
+            rspyWsCloseN(socketId);
         } catch (Throwable ignored) {
         }
     }
