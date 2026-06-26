@@ -14,6 +14,7 @@ import java.net.InetAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Base64;
 import javax.sound.midi.MidiChannel;
 import javax.sound.midi.Receiver;
 import javax.sound.midi.Synthesizer;
@@ -51,6 +52,23 @@ public class Signlink implements Runnable {
     private static Receiver midiReceiver = null;
     private static int midiVolumeLevel = 4;
     private static int waveVolumeLevel = 4;
+
+    // Last MIDI bytes handed to midisave(). Kept verbatim so the browser Web
+    // Audio bridge can play the song straight from memory (CheerpJ has no
+    // javax.sound output line). playMidi() only receives a path, so we thread
+    // the bytes through here instead.
+    private static byte[] lastMidiBytes = null;
+    private static int lastMidiLen = 0;
+
+    /*
+     * CheerpJ native bridge for browser Web Audio MIDI playback. Implemented in
+     * JS as Java_Signlink_<name> and registered via cheerpjInit({ natives: { ... } }).
+     * These are ONLY invoked when RspyClientSocketFactory.isWebClientMode() is
+     * true; the desktop build never touches them.
+     */
+    private static native void rspyPlayMidiN(String b64, boolean loop);
+    private static native void rspyStopMidiN();
+    private static native void rspySetMidiVolumeN(int level);
 
     public static synchronized void setMidiVolumeLegacy(int legacyVolume) {
         midivol = legacyVolume;
@@ -95,7 +113,43 @@ public class Signlink implements Runnable {
         return Math.max(1, Math.min(127, (int) Math.round(127.0D * ((double) level / 4.0D))));
     }
 
+    // Send the in-memory MIDI bytes to the browser Web Audio synth. Used in
+    // web mode in place of the javax.sound sequencer, which has no audio line
+    // under CheerpJ.
+    private static void webPlayMidi(boolean loop) {
+        if (lastMidiBytes == null || lastMidiLen <= 0) {
+            System.out.println("[MIDI] no midi bytes available for web playback");
+            return;
+        }
+
+        try {
+            byte[] payload;
+            if (lastMidiLen == lastMidiBytes.length) {
+                payload = lastMidiBytes;
+            } else {
+                payload = new byte[lastMidiLen];
+                System.arraycopy(lastMidiBytes, 0, payload, 0, lastMidiLen);
+            }
+
+            String b64 = Base64.getEncoder().encodeToString(payload);
+            rspyPlayMidiN(b64, loop);
+            System.out.println("[MIDI] web playback requested len=" + lastMidiLen
+                    + " loop=" + loop + " volumeLevel=" + midiVolumeLevel);
+        } catch (Throwable t) {
+            System.out.println("[MIDI] web audio bridge unavailable: " + t);
+        }
+    }
+
     private static synchronized void applyMidiVolume() {
+        if (RspyClientSocketFactory.isWebClientMode()) {
+            try {
+                rspySetMidiVolumeN(midiVolumeLevel);
+            } catch (Throwable t) {
+                System.out.println("[MIDI] web volume bridge unavailable: " + t);
+            }
+            return;
+        }
+
         if (midiSynthesizer == null) {
             return;
         }
@@ -347,6 +401,8 @@ public class Signlink implements Runnable {
             midipos = (midipos + 1) % 5;
             savelen = len;
             savebuf = data;
+            lastMidiBytes = data;
+            lastMidiLen = len;
             midiplay = true;
             savereq = "jingle" + midipos + ".mid";
 
@@ -357,6 +413,15 @@ public class Signlink implements Runnable {
     }
 
         public static synchronized void stopMidi() {
+        if (RspyClientSocketFactory.isWebClientMode()) {
+            try {
+                rspyStopMidiN();
+            } catch (Throwable t) {
+                System.out.println("[MIDI] web stop bridge unavailable: " + t);
+            }
+            return;
+        }
+
         try {
             if (midiSequencer != null) {
                 midiSequencer.stop();
@@ -385,6 +450,19 @@ public class Signlink implements Runnable {
     }
 
         public static synchronized void playMidi(String path) {
+        if (RspyClientSocketFactory.isWebClientMode()) {
+            // CheerpJ cannot open a javax.sound output line. Route the MIDI
+            // bytes to the browser Web Audio synth instead. Songs (midifade==1)
+            // loop; jingles (midifade==0) play once, mirroring the desktop
+            // sequencer's behaviour.
+            if (midiVolumeLevel <= 0) {
+                System.out.println("[MIDI] suppressed because music volume is Off");
+                return;
+            }
+            webPlayMidi(midifade != 0);
+            return;
+        }
+
         try {
             stopMidi();
 
@@ -470,6 +548,13 @@ public class Signlink implements Runnable {
     }
 
         public static synchronized void playWave(String path) {
+        if (RspyClientSocketFactory.isWebClientMode()) {
+            // No javax.sound output line under CheerpJ. Sound effects are not
+            // yet routed to Web Audio; no-op so it never throws "Can not open
+            // line". MIDI music is the priority.
+            return;
+        }
+
         try {
             stopWave();
 

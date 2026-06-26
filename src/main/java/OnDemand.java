@@ -1,6 +1,7 @@
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -74,36 +75,94 @@ public class OnDemand implements Runnable {
 
     public void read() {
         try {
-            int available = in.available();
+            // Drain every part already buffered, not just one per call. The server
+            // now sends a whole file in a single frame, so without this loop the
+            // client would only consume one 500-byte part per tick (~250 parts/sec)
+            // and the prefetch phase would crawl regardless of delivery speed.
+            while (true) {
+                int available = in.available();
 
-            if ((partAvailable == 0) && (available >= 6)) {
-                active = true;
+                if ((partAvailable == 0) && (available >= 6)) {
+                    active = true;
 
-                in.read(buffer, 0, 6);
+                    in.read(buffer, 0, 6);
 
-                int store = buffer[0] & 0xff;
-                int file = ((buffer[1] & 0xff) << 8) + (buffer[2] & 0xff);
-                int size = ((buffer[3] & 0xff) << 8) + (buffer[4] & 0xff);
-                int part = buffer[5] & 0xff;
+                    int store = buffer[0] & 0xff;
+                    int file = ((buffer[1] & 0xff) << 8) + (buffer[2] & 0xff);
+                    int size = ((buffer[3] & 0xff) << 8) + (buffer[4] & 0xff);
+                    int part = buffer[5] & 0xff;
 
-                current = null;
+                    current = null;
 
-                for (OnDemandRequest request = (OnDemandRequest) pending.peekFront(); request != null; request = (OnDemandRequest) pending.prev()) {
-                    if ((request.store == store) && (request.file == file)) {
-                        current = request;
+                    for (OnDemandRequest request = (OnDemandRequest) pending.peekFront(); request != null; request = (OnDemandRequest) pending.prev()) {
+                        if ((request.store == store) && (request.file == file)) {
+                            current = request;
+                        }
+                        if (current != null) {
+                            request.cycle = 0;
+                        }
                     }
+
                     if (current != null) {
-                        request.cycle = 0;
+                        waitCycles = 0;
+
+                        if (size == 0) {
+                            Signlink.reporterror("Rej: " + store + "," + file);
+
+                            current.data = null;
+
+                            if (current.important) {
+                                synchronized (completed) {
+                                    completed.pushBack(current);
+                                }
+                            } else {
+                                current.unlink();
+                            }
+
+                            current = null;
+                        } else {
+                            if ((current.data == null) && (part == 0)) {
+                                current.data = new byte[size];
+                            }
+
+                            if (current.data == null) {
+                                throw new IOException("missing start of file");
+                            }
+                        }
                     }
+
+                    partOffset = part * 500;
+                    partAvailable = 500;
+
+                    if (partAvailable > (size - (part * 500))) {
+                        partAvailable = size - (part * 500);
+                    }
+
+                    // Header consumed; re-check what's left for the body below.
+                    available = in.available();
                 }
 
-                if (current != null) {
-                    waitCycles = 0;
+                if ((partAvailable > 0) && (available >= partAvailable)) {
+                    active = true;
+                    byte[] dst = buffer;
+                    int offset = 0;
 
-                    if (size == 0) {
-                        Signlink.reporterror("Rej: " + store + "," + file);
+                    if (current != null) {
+                        dst = current.data;
+                        offset = partOffset;
+                    }
 
-                        current.data = null;
+                    in.read(dst, offset, partAvailable);
+
+                    if (((partAvailable + partOffset) >= dst.length) && (current != null)) {
+                        if (game.filestores[0] != null) {
+                            game.filestores[current.store + 1].write(dst, current.file, dst.length);
+                        }
+
+                        if (!current.important && (current.store == 3)) {
+                            current.important = true;
+                            current.store = 93;
+                        }
 
                         if (current.important) {
                             synchronized (completed) {
@@ -112,58 +171,13 @@ public class OnDemand implements Runnable {
                         } else {
                             current.unlink();
                         }
-
-                        current = null;
-                    } else {
-                        if ((current.data == null) && (part == 0)) {
-                            current.data = new byte[size];
-                        }
-
-                        if (current.data == null) {
-                            throw new IOException("missing start of file");
-                        }
                     }
+                    partAvailable = 0;
+                    continue;
                 }
 
-                partOffset = part * 500;
-                partAvailable = 500;
-
-                if (partAvailable > (size - (part * 500))) {
-                    partAvailable = size - (part * 500);
-                }
-            }
-
-            if ((partAvailable > 0) && (available >= partAvailable)) {
-                active = true;
-                byte[] dst = buffer;
-                int offset = 0;
-
-                if (current != null) {
-                    dst = current.data;
-                    offset = partOffset;
-                }
-
-                in.read(dst, offset, partAvailable);
-
-                if (((partAvailable + partOffset) >= dst.length) && (current != null)) {
-                    if (game.filestores[0] != null) {
-                        game.filestores[current.store + 1].write(dst, current.file, dst.length);
-                    }
-
-                    if (!current.important && (current.store == 3)) {
-                        current.important = true;
-                        current.store = 93;
-                    }
-
-                    if (current.important) {
-                        synchronized (completed) {
-                            completed.pushBack(current);
-                        }
-                    } else {
-                        current.unlink();
-                    }
-                }
-                partAvailable = 0;
+                // Nothing more can be fully read right now.
+                break;
             }
         } catch (IOException ioexception) {
             try {
@@ -393,7 +407,11 @@ public class OnDemand implements Runnable {
                     handleQueue();
                     handlePending();
 
-                    if ((importantCount == 0) && (j >= 5)) {
+                    // Allow many more send+drain passes per tick during the
+                    // background prefetch phase. read() now drains all buffered
+                    // parts per call, so more passes here directly raises prefetch
+                    // throughput instead of capping it at ~5 parts/tick.
+                    if ((importantCount == 0) && (j >= 30)) {
                         break;
                     }
 
@@ -513,7 +531,14 @@ public class OnDemand implements Runnable {
         }
 
         try (GzipCompressorInputStream gzis = new GzipCompressorInputStream(new ByteArrayInputStream(request.data))) {
-            request.data = gzis.readAllBytes();
+            // Java 8 (CheerpJ) has no InputStream.readAllBytes().
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] chunk = new byte[8192];
+            int read;
+            while ((read = gzis.read(chunk)) != -1) {
+                out.write(chunk, 0, read);
+            }
+            request.data = out.toByteArray();
         }
 
         return request;
@@ -581,7 +606,7 @@ public class OnDemand implements Runnable {
             }
         }
 
-        while (importantCount < 10) {
+        while (importantCount < 20) {
             OnDemandRequest request = (OnDemandRequest) missing.pollFront();
 
             if (request == null) {
@@ -639,7 +664,7 @@ public class OnDemand implements Runnable {
     }
 
     public void handleExtras() {
-        while ((importantCount == 0) && (requestCount < 10)) {
+        while ((importantCount == 0) && (requestCount < 20)) {
             if (topPriority == 0) {
                 break;
             }
@@ -664,7 +689,7 @@ public class OnDemand implements Runnable {
                     message = "Loading extra files - " + loadedPretechFiles * 100 / totalPrefetchFiles + "%";
                     requestCount++;
 
-                    if (requestCount == 10) {
+                    if (requestCount >= 20) {
                         return;
                     }
                 }
@@ -697,7 +722,7 @@ public class OnDemand implements Runnable {
                     message = "Loading extra files - " + loadedPretechFiles * 100 / totalPrefetchFiles + "%";
                     requestCount++;
 
-                    if (requestCount == 10) {
+                    if (requestCount >= 20) {
                         return;
                     }
                 }

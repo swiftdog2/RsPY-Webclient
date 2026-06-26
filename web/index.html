@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>RsPy Web Client</title>
+
+    <!-- CheerpJ 3 runtime (loaded from Leaning Technologies' CDN; nothing is
+         installed locally). -->
+    <script src="https://cjrtnc.leaningtech.com/3.0/cj3loader.js"></script>
+
+    <!-- Browser WebSocket transport used by WebSocketSocket.java. -->
+    <script src="/rspy-ws-bridge.js"></script>
+
+    <!-- Browser MIDI music output used by Signlink.java under CheerpJ.
+         js-synthesizer = libfluidsynth (WASM) + a GM SoundFont, loaded from the
+         jsDelivr CDN. Order matters: libfluidsynth first, then the JSSynth API,
+         then our bridge. The .wasm sibling is fetched from the same CDN. -->
+    <script src="https://cdn.jsdelivr.net/npm/js-synthesizer@1.13.0/externals/libfluidsynth-2.4.6.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/js-synthesizer@1.13.0/dist/js-synthesizer.js"></script>
+    <script src="/rspy-audio-bridge.js"></script>
+
+    <style>
+        html, body {
+            margin: 0;
+            height: 100%;
+            background: #000;
+            color: #ccc;
+            font-family: sans-serif;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #status { position: fixed; top: 8px; left: 8px; font-size: 12px; opacity: .6; }
+    </style>
+</head>
+<body>
+    <div id="status">starting CheerpJ…</div>
+
+    <script>
+        // Middle-button drag camera rotation (RuneLite-style), bridged into the client.
+        // CheerpJ does not reliably synthesise AWT middle-button events, so we capture
+        // the drag here in the browser (where it is reliable), accumulate the delta, and
+        // the Java client polls it each frame via the Java_Game_rspyPollCameraDragN native.
+        // e.button === 1 is the middle button; preventDefault stops Windows autoscroll.
+        (function () {
+            var dragging = false, lastX = 0, lastY = 0, accDx = 0, accDy = 0;
+            function clampShort(v) { return v < -32768 ? -32768 : (v > 32767 ? 32767 : v); }
+
+            // Consume middle-button events entirely (capture phase, before the CheerpJ
+            // canvas) so the client never mistakes the camera drag for an in-game click.
+            window.addEventListener("mousedown", function (e) {
+                if (e.button === 1) {
+                    dragging = true;
+                    lastX = e.clientX;
+                    lastY = e.clientY;
+                    e.preventDefault();
+                    e.stopPropagation();
+                }
+            }, true);
+            window.addEventListener("mousemove", function (e) {
+                if (!dragging) { return; }
+                accDx = clampShort(accDx + (e.clientX - lastX));
+                accDy = clampShort(accDy + (e.clientY - lastY));
+                lastX = e.clientX;
+                lastY = e.clientY;
+            }, true);
+            window.addEventListener("mouseup", function (e) {
+                if (e.button === 1) {
+                    dragging = false;
+                    e.preventDefault();
+                    e.stopPropagation();
+                }
+            }, true);
+            window.addEventListener("auxclick", function (e) {
+                if (e.button === 1) { e.preventDefault(); e.stopPropagation(); }
+            }, true);
+            window.addEventListener("blur", function () { dragging = false; }, true);
+
+            // Consume the accumulated drag, packed as two signed shorts (dx<<16 | dy).
+            window.rspyPollCameraDrag = function () {
+                var packed = ((accDx & 0xFFFF) << 16) | (accDy & 0xFFFF);
+                accDx = 0;
+                accDy = 0;
+                return packed | 0;
+            };
+        })();
+
+        // CheerpJ native bridge -> the middle-drag accumulator above.
+        async function Java_Game_rspyPollCameraDragN(lib) { return window.rspyPollCameraDrag(); }
+
+        // Point the client at this host's server WebSocket port. Overrides the
+        // URL the jar was compiled with (see rspy-ws-bridge.js).
+        window.RSPY_WS_URL = "ws://" + location.hostname + ":8081/";
+
+        // CheerpJ native bridge -> existing window.rspyWs* helpers.
+        async function Java_WebSocketSocket_rspyWsOpenN(lib, url)       { return window.rspyWsOpen(url); }
+        async function Java_WebSocketSocket_rspyWsStateN(lib, id)       { return window.rspyWsState(id); }
+        async function Java_WebSocketSocket_rspyWsAvailableN(lib, id)   { return window.rspyWsAvailable(id); }
+        async function Java_WebSocketSocket_rspyWsReadN(lib, id, len)   { return window.rspyWsRead(id, len); }
+        async function Java_WebSocketSocket_rspyWsSendN(lib, id, b64)   { return window.rspyWsSend(id, b64); }
+        async function Java_WebSocketSocket_rspyWsErrorN(lib, id)       { return window.rspyWsError(id); }
+        async function Java_WebSocketSocket_rspyWsCloseN(lib, id)       { window.rspyWsClose(id); }
+
+        // CheerpJ native bridge -> browser Web Audio MIDI player (rspy-audio-bridge.js).
+        async function Java_Signlink_rspyPlayMidiN(lib, b64, loop)      { window.rspyPlayMidi(b64, loop); }
+        async function Java_Signlink_rspyStopMidiN(lib)                 { window.rspyStopMidi(); }
+        async function Java_Signlink_rspySetMidiVolumeN(lib, level)     { window.rspySetMidiVolume(level); }
+
+        (async function () {
+            var status = document.getElementById("status");
+            try {
+                await cheerpjInit({
+                    natives: {
+                        Java_WebSocketSocket_rspyWsOpenN,
+                        Java_WebSocketSocket_rspyWsStateN,
+                        Java_WebSocketSocket_rspyWsAvailableN,
+                        Java_WebSocketSocket_rspyWsReadN,
+                        Java_WebSocketSocket_rspyWsSendN,
+                        Java_WebSocketSocket_rspyWsErrorN,
+                        Java_WebSocketSocket_rspyWsCloseN,
+                        Java_Signlink_rspyPlayMidiN,
+                        Java_Signlink_rspyStopMidiN,
+                        Java_Signlink_rspySetMidiVolumeN,
+                        Java_Game_rspyPollCameraDragN
+                    }
+                });
+
+                // AWT display. The client calls game.init(765, 503); a little
+                // extra room covers the Swing frame chrome.
+                cheerpjCreateDisplay(800, 560);
+
+                // CheerpJ mounts the web server root under /app/ in its virtual
+                // filesystem, so the jar served at /rs317-client.jar is here:
+                status.textContent = "loading client…";
+                await cheerpjRunJar("/app/rs317-client.jar");
+                status.style.display = "none";
+            } catch (e) {
+                status.textContent = "failed to start: " + e;
+                status.style.opacity = 1;
+                throw e;
+            }
+        })();
+    </script>
+</body>
+</html>

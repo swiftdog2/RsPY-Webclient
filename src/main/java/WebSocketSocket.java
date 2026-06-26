@@ -44,11 +44,14 @@ public final class WebSocketSocket extends Socket {
     private static native String rspyWsErrorN(int id);
     private static native void rspyWsCloseN(int id);
 
-    private final int socketId;
+    private static final int CONNECT_ATTEMPTS = 3;
+    private static final int CONNECT_RETRY_MS = 250;
+
+    private int socketId;
     private final String url;
 
-    private final InputStream inputStream;
-    private final OutputStream outputStream;
+    private InputStream inputStream;
+    private OutputStream outputStream;
 
     private volatile boolean closed = false;
     private volatile int soTimeoutMillis = 30000;
@@ -56,27 +59,43 @@ public final class WebSocketSocket extends Socket {
     public WebSocketSocket(String url) throws IOException {
         this.url = url;
 
-        int opened;
+        // The first WebSocket the page opens under CheerpJ sometimes fails to
+        // connect (networking warm-up); an immediate retry succeeds. Retry here
+        // so callers don't see a spurious connection failure on the first open.
+        IOException lastError = null;
 
-        try {
-            opened = rspyWsOpenN(url);
-        } catch (UnsatisfiedLinkError e) {
-            throw new IOException(
-                    "CheerpJ native bridge not registered. Add the Java_WebSocketSocket_* " +
-                    "functions to cheerpjInit({ natives: { ... } }) and ensure rspy-ws-bridge.js " +
-                    "is loaded before cheerpjRunJar().",
-                    e
-            );
+        for (int attempt = 1; attempt <= CONNECT_ATTEMPTS; attempt++) {
+            try {
+                this.socketId = rspyWsOpenN(url);
+            } catch (UnsatisfiedLinkError e) {
+                throw new IOException(
+                        "CheerpJ native bridge not registered. Add the Java_WebSocketSocket_* " +
+                        "functions to cheerpjInit({ natives: { ... } }) and ensure rspy-ws-bridge.js " +
+                        "is loaded before cheerpjRunJar().",
+                        e
+                );
+            }
+
+            try {
+                waitForOpen();
+                this.inputStream = new Input();
+                this.outputStream = new Output();
+                System.out.println("[RSPY WEBCLIENT] Connected browser JS WebSocket transport: "
+                        + url + " id=" + socketId + (attempt > 1 ? " (attempt " + attempt + ")" : ""));
+                return;
+            } catch (IOException e) {
+                lastError = e;
+                try {
+                    rspyWsCloseN(socketId);
+                } catch (Throwable ignored) {
+                }
+                if (attempt < CONNECT_ATTEMPTS) {
+                    sleepQuietly(CONNECT_RETRY_MS);
+                }
+            }
         }
 
-        this.socketId = opened;
-
-        waitForOpen();
-
-        this.inputStream = new Input();
-        this.outputStream = new Output();
-
-        System.out.println("[RSPY WEBCLIENT] Connected browser JS WebSocket transport: " + url + " id=" + socketId);
+        throw lastError;
     }
 
     private void waitForOpen() throws IOException {
