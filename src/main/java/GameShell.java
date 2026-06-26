@@ -37,6 +37,9 @@ public abstract class GameShell extends Canvas implements Runnable, MouseListene
     public int mouseClickY;
     public long mouseClickTime;
     public int mouseWheelRotation;
+    public boolean middleButtonDown;
+    public int middleDragPrevX;
+    public int middleDragPrevY;
     public int keyQueueReadPos;
     public int keyQueueWritePos;
 
@@ -247,6 +250,17 @@ public abstract class GameShell extends Canvas implements Runnable, MouseListene
         int y = e.getY();
 
         idleCycles = 0;
+
+        // Middle button starts a camera-rotation drag and is NOT treated as a game click.
+        // Use getButton() (the button that changed) so release detection is symmetric.
+        if (e.getButton() == MouseEvent.BUTTON2) {
+            middleButtonDown = true;
+            middleDragPrevX = x;
+            middleDragPrevY = y;
+            mouseButton = 0;
+            return;
+        }
+
         lastMouseClickX = x;
         lastMouseClickY = y;
         lastMouseClickTime = System.currentTimeMillis();
@@ -264,6 +278,9 @@ public abstract class GameShell extends Canvas implements Runnable, MouseListene
     public void mouseReleased(MouseEvent e) {
         idleCycles = 0;
         mouseButton = 0;
+        if (e.getButton() == MouseEvent.BUTTON2) {
+            middleButtonDown = false;
+        }
     }
 
     @Override
@@ -288,6 +305,20 @@ public abstract class GameShell extends Canvas implements Runnable, MouseListene
         idleCycles = 0;
         mouseX = x;
         mouseY = y;
+
+        // While the middle button is held, dragging rotates the camera instead of
+        // driving any normal left-drag game behaviour (mouseButton stays 0).
+        if (middleButtonDown) {
+            int dx = x - middleDragPrevX;
+            int dy = y - middleDragPrevY;
+            middleDragPrevX = x;
+            middleDragPrevY = y;
+            handleMiddleMouseDrag(dx, dy);
+        }
+    }
+
+    protected void handleMiddleMouseDrag(int dx, int dy) {
+        // Optional subclass hook.
     }
 
     @Override

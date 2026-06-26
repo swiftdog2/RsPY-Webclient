@@ -24,8 +24,28 @@ public class Game extends GameShell {
     private static final int CTRL_WHEEL_ZOOM_MAX = 480;
     private static final int CTRL_WHEEL_ZOOM_STEP = 40;
     private int ctrlMouseWheelZoom = 0;
+
+    // Middle-button drag camera rotation. Sensitivities are camera-units per pixel dragged;
+    // yaw is 0..2047 over a full turn, pitch is clamped to [128, 383] (matching updateOrbitCamera).
+    // Negative yaw sensitivity inverts the X axis (drag right -> orbit left).
+    private static final int MIDDLE_DRAG_YAW_SENSITIVITY = -3;
+    // Negative pitch sensitivity inverts the Y axis (drag down -> tilt up).
+    private static final int MIDDLE_DRAG_PITCH_SENSITIVITY = -1;
+    private static final int ORBIT_CAMERA_PITCH_MIN = 128;
+    private static final int ORBIT_CAMERA_PITCH_MAX = 383;
+
+    // Poll interval while draining on-demand file requests during the startup load
+    // (login music, animations, models, maps). The original client slept 100ms to pace
+    // a dial-up link; against the local cache that just makes the loading screen crawl,
+    // so we poll far more often to finish sooner. handleOnDemandRequests() is a cheap
+    // non-blocking drain, so a short yield is plenty.
+    private static final long LOADING_POLL_SLEEP_MS = 5L;
     public static boolean DEBUG_DUMP_MUSIC_LINE_DATA = false;
     public static boolean DEFAULT_MUSIC_LINES_RED_ON_STARTUP = false;
+    // Flash-only "run through anything" toggle (::noclip). While on, the scene's
+    // collision flags are wiped (and re-wiped on every region load) so the client
+    // pathfinder routes straight through walls; the server stops clip-checking too.
+    public static boolean noclipEnabled = false;
     private static final boolean DEBUG_AUTOCAST_VARPS = false;
     public static boolean DEBUG_VARP_CLICK_IDS = false;
     public static boolean DEBUG_VARP_CLICK_SCAN_SIBLINGS = false;
@@ -892,6 +912,65 @@ public class Game extends GameShell {
         ctrlMouseWheelZoom = clampCtrlWheelZoom(ctrlMouseWheelZoom + (rotation * CTRL_WHEEL_ZOOM_STEP));
     }
 
+    // Middle-button drag rotates the camera, mirroring the arrow keys' pitch/yaw control.
+    // Horizontal drag -> yaw (orbit around the player); vertical drag -> pitch (tilt up/down).
+    // Flip the sign of either sensitivity constant to invert that axis.
+    private void rotateCameraByDrag(int dx, int dy) {
+        orbitCameraYaw = (orbitCameraYaw + (dx * MIDDLE_DRAG_YAW_SENSITIVITY)) & 0x7ff;
+
+        orbitCameraPitch -= dy * MIDDLE_DRAG_PITCH_SENSITIVITY;
+        if (orbitCameraPitch < ORBIT_CAMERA_PITCH_MIN) {
+            orbitCameraPitch = ORBIT_CAMERA_PITCH_MIN;
+        }
+        if (orbitCameraPitch > ORBIT_CAMERA_PITCH_MAX) {
+            orbitCameraPitch = ORBIT_CAMERA_PITCH_MAX;
+        }
+
+        // Drag is direct (1:1), so cancel any residual arrow-key glide velocity.
+        orbitCameraYawVelocity = 0;
+        orbitCameraPitchVelocity = 0;
+    }
+
+    // Desktop/AWT path. Under CheerpJ the browser does not reliably synthesise AWT
+    // middle-button events, so the JS bridge below drives the camera instead; once that
+    // bridge is confirmed live we ignore AWT here to avoid applying the drag twice.
+    @Override
+    protected void handleMiddleMouseDrag(int dx, int dy) {
+        if (cameraDragBridgeActive) {
+            return;
+        }
+        rotateCameraByDrag(dx, dy);
+    }
+
+    // CheerpJ native bridge: implemented in JS as Java_Game_rspyPollCameraDragN and
+    // registered via cheerpjInit({ natives: { ... } }). Returns the middle-button drag
+    // accumulated in the browser since the last poll, packed as two signed shorts:
+    // high 16 bits = dx, low 16 bits = dy. Returns 0 when there is no pending drag.
+    private static native int rspyPollCameraDragN();
+
+    private static boolean cameraDragBridgeActive = false;
+
+    // Polled once per frame from updateOrbitCamera(). On desktop the native is
+    // unregistered and throws, so we silently fall back to the AWT handler above.
+    private void pollBrowserCameraDrag() {
+        int packed;
+        try {
+            packed = rspyPollCameraDragN();
+        } catch (Throwable notUnderCheerpj) {
+            return;
+        }
+
+        cameraDragBridgeActive = true;
+
+        if (packed == 0) {
+            return;
+        }
+
+        int dx = (short) (packed >> 16);
+        int dy = (short) (packed & 0xFFFF);
+        rotateCameraByDrag(dx, dy);
+    }
+
     private boolean isMouseOverGameViewport(int x, int y) {
         return x >= 4 && x <= 516 && y >= 4 && y <= 338;
     }
@@ -1033,7 +1112,7 @@ public class Game extends GameShell {
                     handleOnDemandRequests();
 
                     try {
-                        Thread.sleep(100L);
+                        Thread.sleep(LOADING_POLL_SLEEP_MS);
                     } catch (Exception ignored) {
                     }
 
@@ -1064,7 +1143,7 @@ public class Game extends GameShell {
                 handleOnDemandRequests();
 
                 try {
-                    Thread.sleep(100L);
+                    Thread.sleep(LOADING_POLL_SLEEP_MS);
                 } catch (Exception ignored) {
                 }
 
@@ -1096,8 +1175,13 @@ public class Game extends GameShell {
                 handleOnDemandRequests();
 
                 try {
-                    Thread.sleep(100L);
+                    Thread.sleep(LOADING_POLL_SLEEP_MS);
                 } catch (Exception ignored) {
+                }
+
+                if (ondemand.failCount > 3) {
+                    System.out.println("ondemand");
+                    return;
                 }
             }
 
@@ -1129,7 +1213,7 @@ public class Game extends GameShell {
                     handleOnDemandRequests();
 
                     try {
-                        Thread.sleep(100L);
+                        Thread.sleep(LOADING_POLL_SLEEP_MS);
                     } catch (Exception ignored) {
                     }
                 }
@@ -2143,6 +2227,13 @@ public class Game extends GameShell {
 
             builder.build(levelCollisionMap, scene);
             // FarmingPatchAudit377.dumpLoadedClient();
+
+            // Keep noclip active across region loads: the freshly built collision
+            // map would otherwise restore clipping in the new area.
+            if (noclipEnabled) {
+                applyNoclipFlags();
+            }
+
             areaViewport.bind();
 
             out.writeOp(0);
@@ -3473,6 +3564,11 @@ public class Game extends GameShell {
         titleScreenState = 0;
         username = "";
         password = "";
+        // Clear the noclip flag on logout so the next login starts matched with the
+        // server, which resets player.noclip to False for every fresh login. Without
+        // this, an in-client relog (no page refresh) would leave the static client
+        // flag stuck on while the server's was off, desyncing the two.
+        noclipEnabled = false;
         clearCaches();
         scene.reset();
         for (int i = 0; i < 4; i++) {
@@ -5252,7 +5348,12 @@ public class Game extends GameShell {
                 if (wait > 60) {
                     wait = 60;
                 }
-                jaggrabEnabled = !jaggrabEnabled;
+                // In web mode the HTTP code-base host (play.rspy.org) is not the
+                // local server, so never fall back to it — keep using JAGGRAB
+                // over the WebSocket, which is what this deployment serves.
+                if (!RspyClientSocketFactory.isWebClientMode()) {
+                    jaggrabEnabled = !jaggrabEnabled;
+                }
             }
         }
         return new FileArchive(data);
@@ -6603,17 +6704,21 @@ public class Game extends GameShell {
                 if (chatTyped.equals("::traffic")) {
                     showTraffic = !showTraffic;
                 }
-                if (chatTyped.equals("::noclip")) {
-                    for (int level = 0; level < 4; level++) {
-                        for (int x = 1; x < 103; x++) {
-                            for (int z = 1; z < 103; z++) {
-                                levelCollisionMap[level].flags[x][z] = 0;
-                            }
-                        }
-                    }
-                }
                 if (chatTyped.equals("::dump")) {
                     IfType.dumpInterfaceTree(3559);
+                }
+            }
+
+            // Flash-only noclip toggle. The command is still forwarded to the server
+            // below so both sides flip in lockstep. No local chat message is shown
+            // here: the server is authoritative and sends the single confirmation,
+            // so emitting one here too would double up the feedback.
+            if (chatTyped.equals("::noclip") && isNoclipUser()) {
+                noclipEnabled = !noclipEnabled;
+                if (noclipEnabled) {
+                    applyNoclipFlags();
+                } else {
+                    buildScene();
                 }
             }
 
@@ -7584,6 +7689,11 @@ public class Game extends GameShell {
                 loginMessage0 = "";
                 loginMessage1 = "Connecting to server...";
                 drawTitleScreen(true);
+
+                // Fresh login: the server creates a new Player with noclip = False, so
+                // start the client flag matched. (A reconnect resumes the same server
+                // session and keeps its noclip state, so it must NOT be reset here.)
+                noclipEnabled = false;
             }
 
             connection = new Connection(this, openSocket(43594 + portOffset));
@@ -7698,9 +7808,17 @@ public class Game extends GameShell {
                     spellSelected = 0;
                     sceneState = 0;
                     waveCount = 0;
-                    cameraAnticheatOffsetX = (int) (Math.random() * 100D) - 50;
-                    cameraAnticheatOffsetZ = (int) (Math.random() * 110D) - 55;
-                    cameraAnticheatAngle = (int) (Math.random() * 80D) - 40;
+                    // Anti-cheat camera jitter disabled: centre the camera exactly on the
+                    // player. The original client offset the orbit point (X/Z) and rotated
+                    // the view (angle) by a random amount each region load to defeat
+                    // pixel-based bots; on this server it just makes the camera feel
+                    // off-centre. These three are client-render only (not sent to the
+                    // server), so zeroing them has no protocol impact. The minimap
+                    // anti-cheat values below are left intact because the server needs
+                    // them to interpret minimap click-to-walk.
+                    cameraAnticheatOffsetX = 0;
+                    cameraAnticheatOffsetZ = 0;
+                    cameraAnticheatAngle = 0;
                     minimapAnticheatAngle = (int) (Math.random() * 120D) - 60;
                     minimapZoom = (int) (Math.random() * 30D) - 20;
                     orbitCameraYaw = ((int) (Math.random() * 20D) - 10) & 0x7ff;
@@ -7888,6 +8006,34 @@ public class Game extends GameShell {
         } catch (IOException _ex) {
             loginMessage0 = "";
             loginMessage1 = "Error connecting to server.";
+        }
+    }
+
+    // True if the local player is allowed to use ::noclip. Flash only, matching the
+    // server-side gate in chat_commands._cmd_noclip so both sides toggle in lockstep
+    // (an admin who isn't Flash would otherwise flip the client flag while the server
+    // refused, leaving the two desynced).
+    private boolean isNoclipUser() {
+        if ((localPlayer != null) && (localPlayer.name != null) && localPlayer.name.equalsIgnoreCase("Flash")) {
+            return true;
+        }
+        return (username != null) && username.equalsIgnoreCase("flash");
+    }
+
+    // Clears the loaded scene's collision flags so the client pathfinder treats
+    // every tile as walkable (routes straight through walls). Re-applied on each
+    // buildScene() while noclipEnabled, so it survives region crossings.
+    private void applyNoclipFlags() {
+        for (int level = 0; level < 4; level++) {
+            if (levelCollisionMap[level] == null) {
+                continue;
+            }
+            int[][] flags = levelCollisionMap[level].flags;
+            for (int x = 1; x < 103; x++) {
+                for (int z = 1; z < 103; z++) {
+                    flags[x][z] = 0;
+                }
+            }
         }
     }
 
@@ -8824,6 +8970,21 @@ public class Game extends GameShell {
             moveSpeed <<= 1;
         }
 
+        // Super-speed glide (e.g. "Flash"): when more tiles are queued for a
+        // single tick than a normal run (2), scale the on-screen step so every
+        // queued tile is traversed within one game tick instead of lagging and
+        // snapping. The engine's per-tick budget is ~32 frames, i.e. 4 speed
+        // units per tile per tick (walk=4 for 1 tile, run=8 for 2 tiles), so
+        // pathLength*4 clears all queued tiles smoothly. This only ever raises
+        // the speed and only fires for pathLength > 2, so normal walk (1 tile)
+        // and run (2 tiles) stay exactly as before.
+        if (entity.pathLength > 2) {
+            int glideSpeed = entity.pathLength * 4;
+            if (glideSpeed > moveSpeed) {
+                moveSpeed = glideSpeed;
+            }
+        }
+
         if ((moveSpeed >= 8) && (entity.secondarySeqID == entity.seqWalkID) && (entity.seqRunID != -1)) {
             entity.secondarySeqID = entity.seqRunID;
         }
@@ -9702,6 +9863,9 @@ public class Game extends GameShell {
     }
 
     public void updateOrbitCamera() {
+        // Apply any middle-button drag the browser captured this frame (CheerpJ path).
+        pollBrowserCameraDrag();
+
         int orbitX = localPlayer.x + cameraAnticheatOffsetX;
         int orbitZ = localPlayer.z + cameraAnticheatOffsetZ;
 
@@ -10143,6 +10307,13 @@ private void drawViewportInterfaces() {
 
             if (in.readN(1) == 1) {
                 entityUpdateIDs[entityUpdateCount++] = LOCAL_PLAYER_INDEX;
+            }
+
+            // Super-speed extension: extra steps (count + each direction).
+            // Normal running players send a count of 0, so this is a no-op for them.
+            int extraCount = in.readN(3);
+            for (int e = 0; e < extraCount; e++) {
+                localPlayer.step(true, in.readN(3));
             }
         } else if (type == 3) {
             currentLevel = in.readN(2);
@@ -10995,6 +11166,13 @@ private void drawViewportInterfaces() {
 
                     if (in.readN(1) == 1) {
                         entityUpdateIDs[entityUpdateCount++] = id;
+                    }
+
+                    // Super-speed extension: extra steps (count + each direction).
+                    // Normal running players send a count of 0, so this is a no-op for them.
+                    int extraCount = in.readN(3);
+                    for (int e = 0; e < extraCount; e++) {
+                        player.step(true, in.readN(3));
                     }
                 } else if (type == 3) {
                     entityRemovalIDs[entityRemovalCount++] = id;
