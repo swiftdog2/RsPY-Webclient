@@ -62,7 +62,7 @@ public final class WebSocketSocket extends Socket {
         System.out.println("[RSPY WEBCLIENT] Connected browser JS WebSocket transport: " + url + " id=" + socketId);
     }
 
-    private static synchronized void initJavaScriptBridge() throws IOException {
+            private static synchronized void initJavaScriptBridge() throws IOException {
         if (jsInitialized) {
             return;
         }
@@ -71,30 +71,36 @@ public final class WebSocketSocket extends Socket {
             Class<?> jsObjectClass = Class.forName("netscape.javascript.JSObject");
 
             /*
-             * Old LiveConnect shape:
-             *   JSObject.getWindow(Applet)
+             * RSPY_CHEERPJ_GETWINDOW_FALLBACK_V1
              *
-             * CheerpJ commonly supports applet-era Java apps, so this is the
-             * least invasive bridge to try first. We do this by reflection so
-             * the source compiles even when the IDE/module setup is awkward.
+             * Older browser-Java bridges expose:
+             *     JSObject.getWindow(Applet)
+             *
+             * Current CheerpJ builds may instead expose:
+             *     JSObject.getWindow()
+             *
+             * Do not hard-code the obsolete Applet signature. Resolve the
+             * available static getWindow method at runtime, then use the
+             * normal JSObject.call/eval methods to reach rspy-ws-bridge.js.
              */
-            Class<?> appletClass = Class.forName("java.applet.Applet");
-            Method getWindow = jsObjectClass.getMethod("getWindow", appletClass);
+            jsWindow = resolveJavaScriptWindow(jsObjectClass);
 
-            jsWindow = getWindow.invoke(null, new Object[] { null });
-            jsCallMethod = jsObjectClass.getMethod("call", String.class, Object[].class);
+            jsCallMethod = jsObjectClass.getMethod(
+                "call",
+                String.class,
+                Object[].class
+            );
             jsEvalMethod = jsObjectClass.getMethod("eval", String.class);
 
             if (jsWindow == null) {
-                throw new IOException("JSObject.getWindow(null) returned null.");
+                throw new IOException("CheerpJ JSObject getWindow returned null.");
             }
 
             Object bridgeType = jsEval("typeof window.rspyWsOpen");
-
             if (!"function".equals(String.valueOf(bridgeType))) {
                 throw new IOException(
-                        "Browser bridge is not loaded. Missing window.rspyWsOpen. " +
-                        "Add <script src=\"/rspy-ws-bridge.js\"></script> before cheerpjRunJar()."
+                    "Browser bridge is not loaded. Missing window.rspyWsOpen. " +
+                    "Add <script src=\"/rspy-ws-bridge.js\"></script> before cheerpjRunJar()."
                 );
             }
 
@@ -104,11 +110,89 @@ public final class WebSocketSocket extends Socket {
             throw e;
         } catch (Throwable t) {
             throw new IOException(
-                    "Could not initialize CheerpJ JavaScript bridge. " +
-                    "This build requires CheerpJ/LiveConnect JSObject support.",
-                    t
+                "Could not initialize CheerpJ JavaScript bridge.",
+                t
             );
         }
+    }
+
+    private static Object resolveJavaScriptWindow(Class<?> jsObjectClass) throws Exception {
+        StringBuffer discovered = new StringBuffer();
+
+        /*
+         * Prefer the current no-argument CheerpJ form. This is exactly the
+         * fallback the old code was missing.
+         */
+        try {
+            Method noArgumentGetWindow = jsObjectClass.getMethod("getWindow");
+            discovered.append(noArgumentGetWindow.toString()).append("; ");
+
+            if (java.lang.reflect.Modifier.isStatic(noArgumentGetWindow.getModifiers())) {
+                Object window = noArgumentGetWindow.invoke(null);
+                if (window != null) {
+                    System.out.println(
+                        "[RSPY WEBCLIENT] JSObject bridge using getWindow()"
+                    );
+                    return window;
+                }
+            }
+        } catch (NoSuchMethodException ignored) {
+            // Continue to the generic scan below.
+        }
+
+        /*
+         * Retain compatibility with other bridge implementations. We only
+         * invoke a one-parameter method with null when the parameter is a
+         * reference type, which is safe for legacy Applet/Object forms.
+         */
+        Method[] methods = jsObjectClass.getMethods();
+        for (int i = 0; i < methods.length; i++) {
+            Method candidate = methods[i];
+
+            if (!"getWindow".equals(candidate.getName())) {
+                continue;
+            }
+
+            discovered.append(candidate.toString()).append("; ");
+
+            if (!java.lang.reflect.Modifier.isStatic(candidate.getModifiers())) {
+                continue;
+            }
+
+            Class<?>[] parameters = candidate.getParameterTypes();
+
+            try {
+                Object window = null;
+
+                if (parameters.length == 0) {
+                    window = candidate.invoke(null);
+                } else if (
+                    parameters.length == 1 &&
+                    !parameters[0].isPrimitive()
+                ) {
+                    window = candidate.invoke(null, new Object[] { null });
+                }
+
+                if (window != null) {
+                    System.out.println(
+                        "[RSPY WEBCLIENT] JSObject bridge using " +
+                        candidate.toString()
+                    );
+                    return window;
+                }
+            } catch (Throwable ignored) {
+                /*
+                 * A candidate can exist but still be unsupported by a
+                 * particular runtime. Continue trying any remaining forms.
+                 */
+            }
+        }
+
+        throw new IOException(
+            "CheerpJ exposes no usable static JSObject.getWindow method. " +
+            "Discovered methods: " +
+            (discovered.length() == 0 ? "<none>" : discovered.toString())
+        );
     }
 
     private static Object jsCall(String name, Object[] args) throws IOException {
