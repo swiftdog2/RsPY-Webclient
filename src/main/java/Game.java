@@ -11002,10 +11002,27 @@ private void drawViewportInterfaces() {
     }
 
     public DataInputStream openURL(String s) throws IOException {
+        if (RspyClientSocketFactory.isWebClientMode()) {
+            String base = System.getProperty("rspy.http.cache.url", "https://cache.rspy.org/");
+            if (!base.endsWith("/")) {
+                base += "/";
+            }
+
+            String requested = s.startsWith("/") ? s.substring(1) : s;
+            java.net.URLConnection connection = new java.net.URL(base + requested).openConnection();
+            connection.setUseCaches(false);
+            connection.setConnectTimeout(15000);
+            connection.setReadTimeout(30000);
+            System.out.println("[RSPY HTTP CACHE] " + base + requested);
+            return new DataInputStream(
+                new java.io.BufferedInputStream(connection.getInputStream())
+            );
+        }
+
+        // Keep the desktop/offline client on the original JAGGRAB transport.
         if (!jaggrabEnabled) {
             return new DataInputStream(getCodeBase().resolve(s).toURL().openStream());
         }
-
         if (jaggrabSocket != null) {
             try {
                 jaggrabSocket.close();
