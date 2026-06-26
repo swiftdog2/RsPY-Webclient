@@ -11,7 +11,7 @@ public class GameFrame extends JFrame {
 
     public GameFrame(GameShell shell) {
         this.shell = shell;
-        setTitle("Jagex");
+        setTitle("RsPY - 377 v.5");
         setResizable(false);
         setLayout(new BorderLayout());
         add(shell, BorderLayout.CENTER);

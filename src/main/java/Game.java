@@ -112,8 +112,7 @@ public class Game extends GameShell {
                         ", Scene.lowmem=" + Scene.lowmem +
                         ", Draw3D.lowmem=" + Draw3D.lowmem +
                         ", SceneBuilder.lowmem=" + SceneBuilder.lowmem +
-                        ", LocType.lowmem=" + LocType.lowmem
-        );
+                        ", LocType.lowmem=" + LocType.lowmem);
     }
 
     public static void main(String[] args) throws UnknownHostException {
@@ -2007,7 +2006,8 @@ public class Game extends GameShell {
     static String server = "127.0.0.1";
 
     public Socket openSocket(int port) throws IOException {
-        return new Socket(InetAddress.getByName(server), port);
+        System.out.println("[RSPY PATCH CHECK] Game.openSocket patched, port=" + port);
+        return RspyClientSocketFactory.open(port);
     }
 
     public void handleMouseInput() {

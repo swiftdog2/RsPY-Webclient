@@ -201,7 +201,45 @@ public class Signlink implements Runnable {
         }
     }
 
-    public static String findcachedir() {
+        public static String findcachedir() {
+        if ((storeid < 32) || (storeid > 34)) {
+            storeid = 32;
+        }
+
+        /*
+         * CheerpJ runs inside the browser and cannot write to a real local
+         * C:/ or user-home path. Its /files/ mount is a persistent,
+         * browser-backed filesystem. That is where the RuneScape cache
+         * should live when running through CheerpJ.
+         *
+         * Keep the old desktop fallback so the client can still run normally
+         * outside the browser.
+         */
+        String runtimeInfo = (
+                System.getProperty("java.vm.name", "") + " " +
+                System.getProperty("java.vendor", "") + " " +
+                System.getProperty("java.runtime.name", "")
+        ).toLowerCase();
+
+        if (runtimeInfo.contains("cheerp")) {
+            String path = "/files/.file_store_" + storeid + "/";
+            try {
+                File dir = new File(path);
+                if (!dir.exists()) {
+                    dir.mkdirs();
+                }
+                if (dir.exists() && dir.isDirectory()) {
+                    return path;
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+
+            // Last resort inside CheerpJ. Do not use /files/downloads/
+            // for live cache, because that triggers browser downloads.
+            return "/files/";
+        }
+
         String[] as = {
                 "c:/windows/",
                 "c:/winnt/",
@@ -218,10 +256,6 @@ public class Signlink implements Runnable {
                 "c:/rscache",
                 "/rscache"
         };
-
-        if ((storeid < 32) || (storeid > 34)) {
-            storeid = 32;
-        }
 
         String s = ".file_store_" + storeid;
 
@@ -244,6 +278,7 @@ public class Signlink implements Runnable {
 
         return null;
     }
+
 
     public static int getuid(String s) {
         Path path = Paths.get(s + "uid.dat");
