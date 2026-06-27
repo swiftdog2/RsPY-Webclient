@@ -1834,36 +1834,40 @@ public class Game extends GameShell {
     }
 
     public void loadArchiveChecksums() throws IOException {
-        System.out.println("[RSPY PATCH CHECK] loadArchiveChecksums local-cache mode; HTTP crc bootstrap disabled");
-
         if (archiveChecksum == null) {
             return;
         }
 
-        for (int i = 0; i < archiveChecksum.length && i < 9; i++) {
-            archiveChecksum[i] = 1;
-
-            try {
-                if (filestores != null && filestores.length > 0 && filestores[0] != null) {
-                    byte[] data = filestores[0].read(i);
-
-                    if (data != null) {
-                        crc32.reset();
-                        crc32.update(data);
-                        archiveChecksum[i] = (int) crc32.getValue();
-                        System.out.println("[RSPY CRC] archive " + i + " crc=" + archiveChecksum[i] + " bytes=" + data.length);
-                    } else {
-                        System.out.println("[RSPY CRC] archive " + i + " missing from cache; using placeholder checksum=1");
-                    }
-                }
-            } catch (Exception ex) {
-                archiveChecksum[i] = 1;
-                System.out.println("[RSPY CRC] archive " + i + " crc read failed; using placeholder checksum=1: " + ex);
-            }
+        // 0 is the "no authoritative checksum" sentinel: loadArchive() skips its
+        // staleness comparison for any archive whose expected checksum is 0, so a
+        // failed/absent CRC fetch degrades gracefully to local-cache behaviour
+        // instead of force-redownloading everything.
+        for (int i = 0; i < archiveChecksum.length; i++) {
+            archiveChecksum[i] = 0;
         }
 
-        if (archiveChecksum.length > 8 && archiveChecksum[8] == 0) {
-            archiveChecksum[8] = 1;
+        // Pull the server's authoritative CRC table so loadArchive() can tell a
+        // stale locally cached archive (including the versionlist, archive 5)
+        // from the live cache and re-download it. The OnDemand subsystem then
+        // revalidates idx1-4 files against the freshened versionlist on its own.
+        // Layout: 10 big-endian int32 = [0, crc(archive 1..8), 0].
+        try {
+            DataInputStream in = openURL("crc");
+            byte[] table = new byte[40];
+            in.readFully(table, 0, 40);
+            in.close();
+
+            Buffer buffer = new Buffer(table);
+            for (int i = 0; i < 9 && i < archiveChecksum.length; i++) {
+                archiveChecksum[i] = buffer.read32();
+                System.out.println("[RSPY CRC] archive " + i + " expected crc=" + archiveChecksum[i]);
+            }
+            System.out.println("[RSPY CRC] loaded authoritative crc table from update server");
+        } catch (Exception ex) {
+            for (int i = 0; i < archiveChecksum.length; i++) {
+                archiveChecksum[i] = 0;
+            }
+            System.out.println("[RSPY CRC] crc table unavailable; staleness check disabled this session: " + ex);
         }
     }
 
@@ -5224,13 +5228,15 @@ public class Game extends GameShell {
             crc32.reset();
             crc32.update(data);
 
-            // --- FIX 1: BYPASS LOCAL CACHE CHECK ---
-            // We comment this out so the client doesn't delete the local file
-            // every time you restart the client!
-            // if ((int) crc32.getValue() != expectedChecksum) {
-            //     data = null;
-            // }
-            // ---------------------------------------
+            // Discard the locally cached archive when it no longer matches the
+            // server's authoritative checksum, so the loop below pulls a fresh
+            // copy. expectedChecksum == 0 means "no authoritative crc" (table
+            // unavailable) — keep the local copy rather than force a redownload.
+            if (expectedChecksum != 0 && (int) crc32.getValue() != expectedChecksum) {
+                System.out.println("[RSPY CRC] cached archive " + fileId + " stale (local="
+                    + (int) crc32.getValue() + " expected=" + expectedChecksum + "); refreshing");
+                data = null;
+            }
         }
 
         if (data != null) {
@@ -5297,14 +5303,14 @@ public class Game extends GameShell {
                     crc32.update(data);
                     int calculatedChecksum = (int) crc32.getValue();
 
-                    // --- FIX 2: BYPASS DOWNLOADED FILE CHECK ---
-                    // We comment this out so it accepts the file your Python server just streamed.
-                    // if (calculatedChecksum != expectedChecksum) {
-                    //     data = null;
-                    //     checksumErrors++;
-                    //     error = "Checksum error: " + calculatedChecksum;
-                    // }
-                    // -------------------------------------------
+                    // Reject a corrupt/short download so the retry loop pulls it
+                    // again. Skipped when expectedChecksum == 0 (no authoritative
+                    // crc), so a missing crc table never blocks the boot.
+                    if (expectedChecksum != 0 && calculatedChecksum != expectedChecksum) {
+                        data = null;
+                        checksumErrors++;
+                        error = "Checksum error: " + calculatedChecksum;
+                    }
                 }
             } catch (IOException ioexception) {
                 if (error.equals("Unknown error")) {

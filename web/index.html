@@ -95,6 +95,13 @@
         // https page as mixed content), plain ws:// for local http.
         window.RSPY_WS_URL = (location.protocol === "https:" ? "wss://" : "ws://") + location.hostname + ":8081/";
 
+        // Point the client's HTTP cache (bootstrap JAG archives + /crc staleness
+        // table) at this host's update server too. Mirrors RSPY_WS_URL above and
+        // is injected into the jar as the rspy.http.cache.url system property via
+        // cheerpjInit(javaProperties), overriding the public cache.rspy.org
+        // default the jar was compiled with.
+        window.RSPY_HTTP_CACHE_URL = (location.protocol === "https:" ? "https://" : "http://") + location.hostname + ":8082/";
+
         // CheerpJ native bridge -> existing window.rspyWs* helpers.
         async function Java_WebSocketSocket_rspyWsOpenN(lib, url)       { return window.rspyWsOpen(url); }
         async function Java_WebSocketSocket_rspyWsStateN(lib, id)       { return window.rspyWsState(id); }
@@ -113,6 +120,7 @@
             var status = document.getElementById("status");
             try {
                 await cheerpjInit({
+                    javaProperties: ["rspy.http.cache.url=" + window.RSPY_HTTP_CACHE_URL],
                     natives: {
                         Java_WebSocketSocket_rspyWsOpenN,
                         Java_WebSocketSocket_rspyWsStateN,
